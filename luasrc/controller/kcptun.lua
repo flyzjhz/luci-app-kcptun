@@ -14,13 +14,17 @@
 
 module("luci.controller.kcptun", package.seeall)
 
-local uci  = require "luci.model.uci".cursor()
-local http = require "luci.http"
-local fs   = require "nixio.fs"
-local sys  = require "luci.sys"
-local tpl  = require "luci.template"
-local ipkg = require "luci.model.ipkg"
-local kcptun = "kcptun"
+local uci   = require "luci.model.uci".cursor()
+local http  = require "luci.http"
+local nixio = require "nixio"
+local jsonc = require "luci.jsonc"
+local fs    = require "nixio.fs"
+local sys   = require "luci.sys"
+local tpl   = require "luci.template"
+local ipkg  = require "luci.model.ipkg"
+
+local kcptun_api = "https://api.github.com/repos/xtaci/kcptun/releases/latest"
+local luci_api   = "https://api.github.com/repos/kuoruan/luci-app-kcptun/releases/latest"
 
 local default_log_folder = "/var/log/kcptun"
 
@@ -30,8 +34,7 @@ function index()
 	end
 
 	entry({"admin", "services", "kcptun"},
-		alias("admin", "services", "kcptun", "overview"),
-		_("Kcptun Client")).dependent = true
+		firstchild(), _("Kcptun Client")).dependent = false
 
 	entry({"admin", "services", "kcptun", "overview"},
 		call("action_overview"), _("Overview"), 10)
@@ -70,25 +73,19 @@ local function is_running(file)
 end
 
 local function get_version(type)
-	if not type
-		or type == ""
-		or type == kcptun then
-			type = "client"
-	end
-
 	local version
-	if type == "client" then
-		local client_file = uci:get_first(kcptun, "general", "client_file") or ""
-
-		if client_file ~= "" and fs.access(client_file, "rwx", "rx", "rx") then
-			version = sys.exec("%s -v | cut -d' ' -f3" %{client_file})
-		end
-	elseif type == "luci" then
+	if type == "luci" then
 		local package_name = "luci-app-kcptun"
 		local package_info = ipkg.info(package_name) or {}
 
 		if next(package_info) ~= nil then
 			version = package_info[package_name]["Version"]
+		end
+	else
+		local client_file = uci:get_first(kcptun, "general", "client_file")
+
+		if client_file and fs.access(client_file, "rwx", "rx", "rx") then
+			version = sys.exec("%s -v | cut -d' ' -f3" %{client_file})
 		end
 	end
 
@@ -159,43 +156,92 @@ function action_info()
 	http.write_json(info)
 end
 
+local function get_arch()
+	local arch = nixio.uname().machine or ""
+
+	if arch == "mips" then
+		if fs.access("/usr/lib/os-release") then
+			arch = sys.exec("grep 'LEDE_BOARD' /usr/lib/os-release | grep -oE 'ramips|ar71xx'")
+		elseif fs.access("/etc/openwrt_release") then
+			arch = sys.exec("grep 'DISTRIB_TARGET' /etc/openwrt_release | grep -oE 'ramips|ar71xx'")
+		end
+	end
+
+	return arch
+end
+
 function action_check(type)
-	if not type
-		or type == ""
-		or type == "client"
-		or type == "server" then
-		type = kcptun
+	local arch = http.formvalue("arch") or get_arch()
+
+	local file_tree
+	local sub_version = ""
+
+	if arch:match("^i[%d]86$") then
+		file_tree = "386"
+	elseif arch == "x86_64" then
+		file_tree = "amd64"
+	elseif arch == "ramips" then
+		file_tree = "mipsle"
+	elseif arch == "ar71xx" then
+		file_tree="mips"
+	elseif arch:match("^armv[5-8]") then
+		file_tree="arm"
+		sub_version = arch:match("[5-8]")
 	end
 
-	local arch = http.formvalue("arch") or ""
-	local obj
-
-	local json = {
-		code = 1,
-		needs_update = false
-	}
-
-	local content = sys.exec("sh /usr/lib/%s/%s_update.sh check %s" %{ kcptun, type, arch })
-
-	if content and content ~= "" then
-		obj = luci.jsonc.parse(content)
+	if not file_tree then
+		http.prepare_content("application/json")
+		http.write_json({
+			code = 1,
+			error = "Can't determine ARCH, or ARCH not supported. Please select manually."
+		})
+		return
 	end
 
-	if obj then
-		json.code = obj.code
+	local api_url = type == "luci" and luci_api or kcptun_api
+	local json_content = sys.httpget(api_url)
 
-		if obj.version ~= "" then
-			local old_version = get_version(type)
-			json.needs_update = compare_versions(old_version, "<", obj.version)
-			if json.needs_update then
-				json.version = obj.version
-				json.html_url = obj.html_url
+	if not json_content then
+		http.prepare_content("application/json")
+		http.write_json({
+			code = 1,
+			error = "Can't get version info. Please check your network connection."
+		})
+		return
+	end
+
+	local json = jsonc.parse(json_content) or {}
+
+	local remote_version = json.tag_name:match("[^v]+")
+	local current_version = get_version(type)
+
+	local needs_update = compare_versions(current_version, "<", remote_version)
+	local download_url
+
+	if needs_update then
+		for _, v in ipairs(json.assets) do
+			if v.name and v.name:match("linux-%s" % file_tree) then
+				download_url = v.browser_download_url
 			end
 		end
 	end
 
+	if not download_url and needs_update then
+		http.prepare_content("application/json")
+		http.write_json({
+			code = 1,
+			error = "New version found, but failed to get new version download url."
+		})
+		return
+	end
+
 	http.prepare_content("application/json")
-	http.write_json(json)
+	http.write_json({
+		code = 0,
+		needs_update = needs_update,
+		new_version = remote_version,
+		download_url = download_url
+	})
 end
 
 function action_update(type)

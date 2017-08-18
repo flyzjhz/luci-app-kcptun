@@ -274,24 +274,3 @@ start_service() {
 		return 1
 	fi
 }
-
-stop_service() {
-	_log "Service stoped."
-}
-
-reload_service() {
-	_log "Reload begin..."
-	stop
-	start
-}
-
-restart() {
-	_log "Restart begin..."
-	stop
-	start
-}
-
-boot() {
-	ubus -t 30 wait_for network.interface 2>/dev/null
-	rc_procd start_service
-}
